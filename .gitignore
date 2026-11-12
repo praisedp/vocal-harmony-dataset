@@ -1,0 +1,24 @@
+# OS metadata
+.DS_Store
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Browser automation profiles and session data
+.chrome-automation-profile/
+.spotify-profile/
+
+# Downloaded chart CSV files
+downloads/
+completed.txt
+
+
+

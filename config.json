@@ -1,0 +1,12 @@
+{
+  "start_date": "2026-11-05",
+  "stop_date": "2016-12-01",
+  "chart_type": "regional-global-weekly",
+  "page_load_wait_seconds": 1.0,
+  "failure_retry_wait_seconds": 3.0,
+  "downloads_dir": "downloads",
+  "completed_file": "completed.txt",
+  "headless": false,
+  "profile_dir": ".chrome-automation-profile",
+  "download_timeout_ms": 25000
+}
