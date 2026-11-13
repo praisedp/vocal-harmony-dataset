@@ -8,15 +8,63 @@ or run directly from CLI to test a single date.
 from __future__ import annotations
 
 import argparse
+import math
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeoutError
 
 from downloader import DEFAULT_DOWNLOADS_DIR, download_chart_csv
 
 BASE_VIEW_URL = "https://charts.spotify.com/charts/view"
 DEFAULT_CHART_TYPE = "regional-global-weekly"
+TABLE_TIMEOUT_MS = 25000
+TABLE_REFRESH_INTERVAL_MS = 5000
+
+
+def wait_for_chart_table(page: Page, selector: str) -> tuple[bool, int | None]:
+    """Give the table 25 seconds, refreshing at 5, 10, 15 and 20 seconds.
+
+    Reload time counts toward the same deadline. A successful table load stops
+    recovery immediately; transient reload errors do not reset the deadline.
+    """
+    deadline = time.monotonic() + TABLE_TIMEOUT_MS / 1000
+    interval = TABLE_REFRESH_INTERVAL_MS / 1000
+    next_refresh = deadline - TABLE_TIMEOUT_MS / 1000 + interval
+    last_http_status = None
+    while True:
+        now = time.monotonic()
+        if now >= deadline:
+            return False, last_http_status
+        wait_seconds = min(next_refresh, deadline) - now
+        if wait_seconds > 0:
+            try:
+                page.locator(selector).first.wait_for(
+                    state="attached", timeout=max(1, math.ceil(wait_seconds * 1000))
+                )
+                return True, last_http_status
+            except PlaywrightTimeoutError:
+                pass
+        now = time.monotonic()
+        if now >= deadline:
+            return False, last_http_status
+        if now >= next_refresh:
+            # Commit waits only for navigation to begin; the table wait below
+            # handles hydration. Bound reloads by the next refresh/deadline.
+            reload_budget = min(next_refresh + interval, deadline) - now
+            print("[*] Chart table is still loading; refreshing the page...")
+            try:
+                response = page.reload(
+                    wait_until="commit", timeout=max(1, math.ceil(reload_budget * 1000))
+                )
+                if response is not None:
+                    last_http_status = response.status
+            except PlaywrightError as err:
+                if page.is_closed():
+                    raise
+                print(f"[!] Refresh did not finish; continuing within the table deadline: {err}")
+            next_refresh += interval
 
 
 def build_chart_url(date_str: str, chart_type: str = DEFAULT_CHART_TYPE) -> str:
@@ -36,28 +84,32 @@ def open_chart_for_date(
     date_str: str,
     chart_type: str = DEFAULT_CHART_TYPE,
     wait_for_selector: str = "table, [role='table'], [data-testid='table']",
-    timeout_ms: int = 30000,
+    timeout_ms: int = 25000,
 ) -> dict:
     """Navigate page to the specified chart date and verify readiness.
 
     Returns a status dictionary with details about the load.
     """
     target_url = build_chart_url(date_str, chart_type)
-    print(f"[*] Navigating to: {target_url}")
+    print(f"[*] Navigating to: {target_url} (timeout: {timeout_ms/1000:.1f}s)")
 
-    response = page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
-    http_status = response.status if response else None
+    http_status = None
+    try:
+        response = page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        http_status = response.status if response else None
+    except PlaywrightError as err:
+        if page.is_closed():
+            raise
+        # A timed-out/offline navigation still gets the same table recovery
+        # window, including previously failed weeks with a 5-second goto limit.
+        print(f"[!] Navigation did not finish; trying table refresh recovery: {err}")
 
     # Wait for dynamic table / chart content to attach if present
     table_found = False
     if wait_for_selector:
-        try:
-            page.locator(wait_for_selector).first.wait_for(
-                state="attached", timeout=8000
-            )
-            table_found = True
-        except PlaywrightTimeoutError:
-            table_found = False
+        table_found, refreshed_status = wait_for_chart_table(page, wait_for_selector)
+        if refreshed_status is not None:
+            http_status = refreshed_status
 
     result = {
         "date": date_str,
@@ -79,10 +131,25 @@ def open_and_download_chart(
     output_dir: Path = DEFAULT_DOWNLOADS_DIR,
     target_filename: str | None = None,
     wait_seconds: float = 1.0,
+    page_timeout_ms: int = 25000,
+    download_timeout_ms: int = 25000,
 ) -> tuple[dict, Path]:
     """Navigate to a chart date, ensure readiness, wait, and download the CSV."""
-    status = open_chart_for_date(page, date_str=date_str, chart_type=chart_type)
-    
+    status = open_chart_for_date(
+        page=page,
+        date_str=date_str,
+        chart_type=chart_type,
+        timeout_ms=page_timeout_ms,
+    )
+
+    expected_path = urlsplit(build_chart_url(date_str, chart_type)).path.rstrip("/")
+    if urlsplit(status["url"]).path.rstrip("/") != expected_path:
+        raise RuntimeError(f"Chart redirected away from requested region/week: {status['url']}")
+    if status["http_status"] is not None and status["http_status"] >= 400:
+        raise RuntimeError(f"Chart returned HTTP {status['http_status']}")
+    if not status["table_ready"]:
+        raise RuntimeError("Requested chart table did not load within 25 seconds, including refreshes")
+
     # Wait configured seconds after page load before triggering download
     if wait_seconds > 0:
         time.sleep(wait_seconds)
@@ -92,6 +159,7 @@ def open_and_download_chart(
         page=page,
         target_filename=filename,
         output_dir=output_dir,
+        timeout_ms=download_timeout_ms,
     )
     status["csv_path"] = str(saved_path)
     return status, saved_path

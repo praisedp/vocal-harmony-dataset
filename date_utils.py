@@ -7,6 +7,8 @@ starting date down to a specified target date (e.g. December 2016).
 from __future__ import annotations
 
 import argparse
+import os
+import tempfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Union
@@ -76,10 +78,82 @@ def load_completed_dates(file_path: Union[str, Path]) -> list[str]:
 def record_completed_date(file_path: Union[str, Path], date_str: str) -> None:
     """Append a completed date to the record file and flush immediately."""
     path = Path(file_path)
+    if date_str in set(load_completed_dates(path)):
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(f"{date_str}\n")
         f.flush()
+        os.fsync(f.fileno())
+
+
+def load_failed_dates(file_path: Union[str, Path]) -> list[str]:
+    """Read failed dates from file, preserving file order."""
+    path = Path(file_path)
+    if not path.exists():
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+def record_failed_date(file_path: Union[str, Path], date_str: str) -> None:
+    """Append a failed date to the record file if not already present."""
+    path = Path(file_path)
+    existing = set(load_failed_dates(path))
+    if date_str in existing:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"{date_str}\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def save_dates(file_path: Union[str, Path], dates: list[str]) -> None:
+    """Atomically replace a date ledger without leaving a half-written file."""
+    path = Path(file_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            for value in dict.fromkeys(dates):
+                handle.write(f"{value}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def remove_failed_date(file_path: Union[str, Path], date_str: str) -> None:
+    """Remove a date from the failed records file upon successful download."""
+    path = Path(file_path)
+    if not path.exists():
+        return
+    existing = load_failed_dates(path)
+    if date_str not in existing:
+        return
+    updated = [d for d in existing if d != date_str]
+    save_dates(path, updated)
+
+
+def sync_failed_dates(
+    failed_file: Union[str, Path],
+    completed_file: Union[str, Path],
+) -> list[str]:
+    """Prune any dates from failed_file that are already recorded in completed_file."""
+    failed = load_failed_dates(failed_file)
+    completed_set = set(load_completed_dates(completed_file))
+    active_failed = [d for d in failed if d not in completed_set]
+
+    # If some dates were completed, rewrite failed file
+    if len(active_failed) != len(failed):
+        save_dates(failed_file, active_failed)
+
+    return active_failed
+
 
 
 def get_remaining_dates(
@@ -87,7 +161,7 @@ def get_remaining_dates(
     stop_date: Union[str, date] = DEFAULT_STOP_DATE,
     completed_file: Union[str, Path] = "completed.txt",
 ) -> tuple[list[str], list[str], str | None]:
-    """Calculate remaining weekly dates to process, taking completed.txt into account.
+    """Calculate every missing weekly date, including gaps before the oldest record.
 
     Returns:
         tuple of (remaining_dates_to_process, already_completed_dates, oldest_completed_date)
@@ -101,19 +175,10 @@ def get_remaining_dates(
         )
         return remaining, [], None
 
-    # Find the oldest (earliest in time) completed date
+    # Compare the ENTIRE requested range; never jump over missing earlier weeks.
     oldest_completed = min(completed)
-    oldest_dt = parse_date(oldest_completed)
-    earliest_stop = parse_date(stop_date)
-
-    # Next matching weekly date before the oldest completed
-    resume_start = oldest_dt - timedelta(days=7)
-
-    if resume_start < earliest_stop:
-        return [], completed, oldest_completed
-
     candidates = generate_weekly_dates_backwards(
-        start_date=resume_start, stop_date=stop_date
+        start_date=start_date, stop_date=stop_date
     )
     remaining = [d for d in candidates if d not in completed_set]
     return remaining, completed, oldest_completed

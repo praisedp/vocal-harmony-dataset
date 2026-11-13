@@ -19,6 +19,8 @@ wheels/
 # Downloaded chart CSV files
 downloads/
 completed.txt
+failed.txt
+state/
 
-
-
+# Generated aggregated datasets
+data/

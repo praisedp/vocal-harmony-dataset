@@ -8,11 +8,16 @@ the designated downloads/ directory.
 from __future__ import annotations
 
 import argparse
+import os
+import re
+import tempfile
 from pathlib import Path
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 
-DEFAULT_DOWNLOADS_DIR = Path("downloads").resolve()
+from chart_csv import validate_chart_csv
+
+DEFAULT_DOWNLOADS_DIR = Path(__file__).resolve().parent / "downloads"
 
 # Ordered list of reliable CSS selectors for the CSV download button
 CSV_BUTTON_SELECTORS = [
@@ -65,11 +70,26 @@ def download_chart_csv(
 
     download = download_info.value
     suggested_name = download.suggested_filename
+    expected = re.fullmatch(r"(regional-[a-z]+-weekly)-(\d{4}-\d{2}-\d{2})\.csv", target_filename or "")
+    if expected and suggested_name.startswith("regional-"):
+        chart, date_str = expected.groups()
+        dates = re.findall(r"\d{4}-\d{2}-\d{2}", suggested_name)
+        if not suggested_name.startswith(f"{chart}-") or not dates or dates[-1] != date_str:
+            raise ValueError(f"Server offered a different chart/week: {suggested_name}")
     final_filename = target_filename if target_filename else suggested_name
     destination = output_dir / final_filename
 
-    # Save to disk
-    download.save_as(str(destination))
+    # Keep partially saved/invalid downloads out of the CSV input directory.
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=output_dir, suffix=".part", delete=False) as handle:
+            temporary_path = Path(handle.name)
+        download.save_as(str(temporary_path))
+        validate_chart_csv(temporary_path)
+        os.replace(temporary_path, destination)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
     if destination.exists():
         file_size = destination.stat().st_size

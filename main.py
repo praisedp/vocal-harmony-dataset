@@ -1,262 +1,225 @@
-"""Main Spotify Charts Batch CSV Downloader.
-
-Features:
-- Configurable via config.json (start_date, stop_date, wait intervals, directories)
-- Resumes automatically from completed.txt (finds the oldest completed date and continues backwards)
-- Real-time terminal progress using the Rich library (week in progress, completed, remaining)
-- Immediate progression to next date upon download completion, 3s pause on failure
-- Graceful cancellation handling (Ctrl+C preserves state for resumption)
-"""
+"""Download Global, then every selected country, with independent durable progress."""
 
 from __future__ import annotations
 
 import argparse
-import sys
-import time
+import csv
+from contextlib import ExitStack
+from dataclasses import dataclass, replace
 from pathlib import Path
+import time
 
 from rich.console import Console
-from rich.panel import Panel
 from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TaskProgressColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
+    Progress, SpinnerColumn, BarColumn, MofNCompleteColumn, TextColumn,
+    TimeElapsedColumn, TimeRemainingColumn,
 )
 from rich.table import Table
 
 from browser import get_browser_session
+from chart_csv import validate_chart_csv
 from chart_page import open_and_download_chart
-from config import ScraperConfig, get_config
+from config import CONFIG_FILE_PATH, ScraperConfig, get_config
 from date_utils import (
     generate_weekly_dates_backwards,
-    get_remaining_dates,
+    load_completed_dates,
+    load_failed_dates,
     record_completed_date,
+    record_failed_date,
+    remove_failed_date,
+    save_dates,
+    sync_failed_dates,
 )
+from regions import GLOBAL_CHART, REGIONS, region_name, resolve_chart_types
 
 console = Console()
 
 
-def display_welcome_banner(
-    config: ScraperConfig,
-    total_dates: int,
-    completed_dates_count: int,
-    remaining_dates_count: int,
-    oldest_completed: str | None,
-    next_resume_date: str | None,
-) -> None:
-    """Print a clean Rich panel summarizing the configuration and resume status."""
-    info_table = Table.grid(padding=(0, 2))
-    info_table.add_column(style="bold cyan")
-    info_table.add_column()
+@dataclass
+class RegionPlan:
+    config: ScraperConfig
+    all_dates: list[str]
+    completed: set[str]
+    retries: list[str]
+    remaining: list[str]
 
-    info_table.add_row("Start Date:", config.start_date)
-    info_table.add_row("Earliest Date (Stop):", config.stop_date)
-    info_table.add_row("Chart Type:", config.chart_type)
-    info_table.add_row("Page Load Wait:", f"{config.page_load_wait_seconds}s")
-    info_table.add_row("Failure Pause:", f"{config.failure_retry_wait_seconds}s")
-    info_table.add_row("Downloads Folder:", str(config.downloads_dir))
-    info_table.add_row("Completed Records:", str(config.completed_file))
-    info_table.add_row("Total Weeks in Scope:", str(total_dates))
-    info_table.add_row("Already Completed:", f"[green]{completed_dates_count}[/green]")
-    info_table.add_row("Remaining to Download:", f"[yellow]{remaining_dates_count}[/yellow]")
+    @property
+    def outstanding(self) -> int:
+        return len(self.all_dates) - len(self.completed)
 
-    if oldest_completed:
-        info_table.add_row("Oldest Completed in File:", f"[magenta]{oldest_completed}[/magenta]")
-        info_table.add_row("Resuming From:", f"[bold green]{next_resume_date}[/bold green]")
+
+def config_for_region(config: ScraperConfig, chart_type: str) -> ScraperConfig:
+    """Keep legacy Global progress intact; countries never share date ledgers."""
+    if chart_type == GLOBAL_CHART:
+        completed_file, failed_file = config.completed_file, config.failed_file
     else:
-        info_table.add_row("Starting Fresh From:", f"[bold green]{config.start_date}[/bold green]")
-
-    panel = Panel(
-        info_table,
-        title="[bold green]Spotify Charts Historical CSV Downloader[/bold green]",
-        subtitle="[dim]Press Ctrl+C anytime to pause. Progress is saved automatically.[/dim]",
-        border_style="bright_blue",
-    )
-    console.print(panel)
+        directory = config.state_dir / chart_type
+        completed_file, failed_file = directory / "completed.txt", directory / "failed.txt"
+    return replace(config, chart_type=chart_type, chart_types=None,
+                   completed_file=completed_file, failed_file=failed_file)
 
 
-def run_batch_downloader(config: ScraperConfig) -> None:
-    config.downloads_dir.mkdir(parents=True, exist_ok=True)
+def prepare_region(config: ScraperConfig, *, reconcile: bool = True) -> RegionPlan:
+    """Check every requested week and its CSV, repairing progress after interruptions.
 
-    # 1. Generate full scope of dates from start down to stop
-    all_dates = generate_weekly_dates_backwards(
-        start_date=config.start_date,
-        stop_date=config.stop_date,
-    )
-    total_dates = len(all_dates)
+    Valid CSVs saved before a crash are recovered. Missing/corrupt CSVs previously
+    marked complete become pending again. Read-only status uses reconcile=False.
+    """
+    dates = generate_weekly_dates_backwards(config.start_date, config.stop_date)
+    scope = set(dates)
+    recorded = load_completed_dates(config.completed_file)
+    completed = set()
+    for date_str in dates:
+        path = config.downloads_dir / f"{config.chart_type}-{date_str}.csv"
+        if not path.is_file():
+            continue
+        try:
+            validate_chart_csv(path)
+        except (OSError, UnicodeError, ValueError, csv.Error):
+            continue
+        completed.add(date_str)
 
-    # 2. Check completed.txt to determine resume point
-    remaining_dates, completed_dates, oldest_completed = get_remaining_dates(
-        start_date=config.start_date,
-        stop_date=config.stop_date,
-        completed_file=config.completed_file,
-    )
+    invalid_records = (set(recorded) & scope) - completed
+    recovered = [date_str for date_str in dates if date_str in completed and date_str not in recorded]
+    if reconcile:
+        if invalid_records or recovered:
+            save_dates(config.completed_file,
+                       [date_str for date_str in recorded if date_str not in invalid_records] + recovered)
+        for date_str in dates:
+            if date_str in invalid_records:
+                record_failed_date(config.failed_file, date_str)
+        failed = set(sync_failed_dates(config.failed_file, config.completed_file))
+    else:
+        failed = set(load_failed_dates(config.failed_file)) | invalid_records
+    retries = [date_str for date_str in dates if date_str in failed and date_str not in completed]
+    remaining = [date_str for date_str in dates if date_str not in completed and date_str not in failed]
+    return RegionPlan(config, dates, completed, retries, remaining)
 
-    completed_count = len(completed_dates)
-    remaining_count = len(remaining_dates)
-    next_resume_date = remaining_dates[0] if remaining_dates else None
 
-    # 3. Display summary banner
-    display_welcome_banner(
-        config=config,
-        total_dates=total_dates,
-        completed_dates_count=completed_count,
-        remaining_dates_count=remaining_count,
-        oldest_completed=oldest_completed,
-        next_resume_date=next_resume_date,
-    )
+def download_region(page, plan: RegionPlan) -> RegionPlan:
+    """Attempt each outstanding date once, with previous failures first."""
+    config = plan.config
+    name = region_name(config.chart_type)
+    console.print(f"\n[bold cyan]{name} ({config.chart_type})[/bold cyan]: "
+                  f"{len(plan.completed)}/{len(plan.all_dates)} verified; "
+                  f"{len(plan.retries)} retries, {len(plan.remaining)} other missing weeks")
+    console.print(f"Failure records: {config.failed_file}")
+    queue = [(date_str, True) for date_str in plan.retries]
+    queue.extend((date_str, False) for date_str in plan.remaining)
+    with Progress(SpinnerColumn(), TextColumn("{task.description}"), BarColumn(),
+                  MofNCompleteColumn(), TimeElapsedColumn(), TimeRemainingColumn(),
+                  console=console) as progress:
+        task = progress.add_task(name, total=len(queue))
+        for date_str, retry in queue:
+            progress.update(task, description=f"{name}: {date_str}" + (" (retry)" if retry else ""))
+            # Write BEFORE navigation: Ctrl+C or a crash keeps the in-flight week retryable.
+            record_failed_date(config.failed_file, date_str)
+            try:
+                _, saved_file = open_and_download_chart(
+                    page=page,
+                    date_str=date_str,
+                    chart_type=config.chart_type,
+                    output_dir=config.downloads_dir,
+                    wait_seconds=config.page_load_wait_seconds,
+                    page_timeout_ms=int(1000 * (config.retry_page_timeout_seconds if retry
+                                               else config.standard_page_timeout_seconds)),
+                    download_timeout_ms=config.download_timeout_ms,
+                )
+                expected = config.downloads_dir / f"{config.chart_type}-{date_str}.csv"
+                if saved_file.resolve() != expected.resolve():
+                    raise ValueError(f"Unexpected saved CSV path: {saved_file}")
+                validate_chart_csv(saved_file)
+            except Exception as err:
+                progress.console.print(f"Failed {name} {date_str}: {err}", markup=False)
+                if config.failure_retry_wait_seconds > 0:
+                    time.sleep(config.failure_retry_wait_seconds)
+            else:
+                # Ledger failures must stop the run, rather than masquerade as download errors.
+                record_completed_date(config.completed_file, date_str)
+                remove_failed_date(config.failed_file, date_str)
+                plan.completed.add(date_str)
+                progress.console.print(f"✓ {name} {date_str}: {saved_file.name}", markup=False)
+            progress.advance(task)
+    # Re-audit files and ledgers; attempted weeks are never confused with completed weeks.
+    return prepare_region(config)
 
-    if not remaining_dates:
-        console.print(
-            "\n[bold green]All dates in the configured range have already been downloaded![/bold green]"
-        )
-        return
 
-    # 4. Initialize Rich Progress
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[bold cyan]{task.description}"),
-        BarColumn(bar_width=30),
-        TaskProgressColumn(),
-        MofNCompleteColumn(),
-        TextColumn("[yellow]({task.fields[remaining]} remaining)[/yellow]"),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-    )
+def print_summary(plans: list[RegionPlan]) -> None:
+    table = Table(title="Verified chart coverage")
+    for title in ("Location", "CSV weeks", "Weeks in scope", "Failed / interrupted", "Outstanding"):
+        table.add_column(title)
+    for plan in plans:
+        table.add_row(region_name(plan.config.chart_type), str(len(plan.completed)),
+                      str(len(plan.all_dates)), str(len(plan.retries)), str(plan.outstanding))
+    console.print(table)
+    outstanding = sum(plan.outstanding for plan in plans)
+    if outstanding:
+        console.print(f"[yellow]{outstanding:,} region/weeks remain outstanding. "
+                      "Rerun to retry; each region keeps its own failure records.[/yellow]")
+    else:
+        console.print("[green]All requested region/weeks have validated CSVs.[/green]")
 
-    task_id = progress.add_task(
-        description=f"Week: {remaining_dates[0]}",
-        total=total_dates,
-        completed=completed_count,
-        remaining=remaining_count,
-    )
 
-    successful_runs = 0
-    failed_runs = 0
-
-    try:
-        with progress:
-            with get_browser_session(
-                profile_dir=config.profile_dir,
-                downloads_dir=config.downloads_dir,
-                headless=config.headless,
-            ) as (context, page):
-
-                for idx, date_str in enumerate(remaining_dates, start=1):
-                    # Update progress description to current active week
-                    progress.update(
-                        task_id,
-                        description=f"Week: [bold white]{date_str}[/bold white]",
-                        remaining=len(remaining_dates) - (idx - 1),
-                    )
-
-                    try:
-                        # 1) Open chart page
-                        # 2) Wait 1s (config.page_load_wait_seconds)
-                        # 3) Trigger download and wait for finish
-                        status, saved_file = open_and_download_chart(
-                            page=page,
-                            date_str=date_str,
-                            chart_type=config.chart_type,
-                            output_dir=config.downloads_dir,
-                            wait_seconds=config.page_load_wait_seconds,
-                        )
-
-                        # Record completed date immediately
-                        record_completed_date(config.completed_file, date_str)
-                        successful_runs += 1
-
-                        file_size = saved_file.stat().st_size if saved_file.exists() else 0
-                        progress.console.print(
-                            f"[bold green]✓[/bold green] [{date_str}] Downloaded: [green]{saved_file.name}[/green] ({file_size:,} bytes)"
-                        )
-
-                        # Update progress bar
-                        progress.update(
-                            task_id,
-                            advance=1,
-                            remaining=len(remaining_dates) - idx,
-                        )
-
-                    except Exception as err:
-                        failed_runs += 1
-                        progress.console.print(
-                            f"[bold red]✗[/bold red] [{date_str}] Failed: {err}. "
-                            f"Waiting {config.failure_retry_wait_seconds}s before next..."
-                        )
-                        time.sleep(config.failure_retry_wait_seconds)
-
-    except KeyboardInterrupt:
-        console.print(
-            "\n[bold yellow]Paused by user (Ctrl+C).[/bold yellow] "
-            "All downloaded dates are saved in completed.txt. Rerun anytime to resume exactly where you left off!"
-        )
-    except Exception as err:
-        console.print(f"\n[bold red]Unexpected error during batch run: {err}[/bold red]")
-
-    # 5. Final summary
-    summary_table = Table(title="Batch Run Summary", border_style="cyan")
-    summary_table.add_column("Category", style="bold")
-    summary_table.add_column("Count", justify="right")
-
-    summary_table.add_row("Total Weeks in Scope", str(total_dates))
-    summary_table.add_row("Downloaded in this session", f"[green]{successful_runs}[/green]")
-    summary_table.add_row("Failed in this session", f"[red]{failed_runs}[/red]" if failed_runs else "0")
-    summary_table.add_row("Total Recorded Completed", str(completed_count + successful_runs))
-    summary_table.add_row("Remaining Outstanding", str(max(0, total_dates - (completed_count + successful_runs))))
-
-    console.print()
-    console.print(summary_table)
+def run_batch_downloader(config: ScraperConfig, *, status_only: bool = False) -> list[RegionPlan]:
+    charts = resolve_chart_types(list(config.chart_types) if config.chart_types else config.chart_type)
+    console.print(f"{len(charts)} locations, {config.start_date} back to {config.stop_date}; "
+                  "Global first when selected.")
+    plans = []
+    # Reuse one authenticated browser for all countries. No browser opens for status
+    # or when all selected downloads are already verified on disk.
+    with ExitStack() as stack:
+        page = None
+        for index, chart in enumerate(charts, start=1):
+            console.print(f"[{index}/{len(charts)}] Checking {region_name(chart)}...")
+            plan = prepare_region(config_for_region(config, chart), reconcile=not status_only)
+            if plan.outstanding and not status_only:
+                if page is None:
+                    _, page = stack.enter_context(get_browser_session(
+                        profile_dir=config.profile_dir, downloads_dir=config.downloads_dir,
+                        headless=config.headless))
+                plan = download_region(page, plan)
+            plans.append(plan)
+    print_summary(plans)
+    return plans
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Spotify Charts Batch Downloader with auto-resume and Rich progress."
-    )
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=Path("config.json"),
-        help="Path to custom config.json file (default: config.json)",
-    )
-    parser.add_argument(
-        "--start-date",
-        default=None,
-        help="Override start date (e.g. 2026-11-05)",
-    )
-    parser.add_argument(
-        "--stop-date",
-        default=None,
-        help="Override earliest stop date (e.g. 2016-12-01)",
-    )
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run browser in headless mode",
-    )
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=CONFIG_FILE_PATH)
+    parser.add_argument("--start-date", help="Override newest chart week (YYYY-MM-DD)")
+    parser.add_argument("--stop-date", help="Override earliest chart week (YYYY-MM-DD)")
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--regions", nargs="+", help="all, or codes such as global co au")
+    parser.add_argument("--list-regions", action="store_true", help="List locations without opening Chrome")
+    parser.add_argument("--status", action="store_true", help="Read-only CSV coverage audit; no Chrome or state writes")
     return parser.parse_args()
 
 
-def main():
+def main() -> int:
     args = parse_args()
-    config = get_config(args.config)
-
-    # Command-line overrides if provided
-    if args.start_date:
-        config.start_date = args.start_date
-    if args.stop_date:
-        config.stop_date = args.stop_date
-    if args.headless:
-        config.headless = True
-
-    run_batch_downloader(config)
+    if args.list_regions:
+        for code, name in REGIONS.items():
+            console.print(f"{code:6} {name:20} regional-{code}-weekly")
+        return 0
+    try:
+        config = get_config(args.config)
+        if args.start_date:
+            config.start_date = args.start_date
+        if args.stop_date:
+            config.stop_date = args.stop_date
+        if args.headless:
+            config.headless = True
+        if args.regions:
+            config.chart_types = resolve_chart_types(args.regions)
+        plans = run_batch_downloader(config, status_only=args.status)
+        return 0 if args.status or all(not plan.outstanding for plan in plans) else 1
+    except KeyboardInterrupt:
+        console.print("\nPaused. Completed files and in-flight/failed weeks are saved per region. Rerun to resume.")
+        return 130
+    except Exception as err:
+        console.print(f"\nStopped: {err}", markup=False)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
