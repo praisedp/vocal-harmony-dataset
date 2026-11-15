@@ -13,6 +13,7 @@ class TableRecoveryTests(unittest.TestCase):
         clock = [0.0]
         refreshes = []
         page = MagicMock()
+        page.locator.return_value.is_visible.return_value = False
         page.is_closed.return_value = False
         page.url = chart_page.build_chart_url("2026-11-05")
         page.title.return_value = "Spotify Charts"
@@ -113,6 +114,34 @@ class TableRecoveryTests(unittest.TestCase):
         self.assertTrue(result["table_ready"])
         self.assertEqual(result["http_status"], 200)
         self.assertEqual(refreshes, [5])
+
+    def test_explicit_unavailable_page_stops_immediately_without_refresh(self):
+        page, clock, refreshes = self.make_page()
+        page.locator.return_value.is_visible.return_value = True
+        with redirect_stdout(io.StringIO()), patch.object(chart_page.time, "monotonic", side_effect=lambda: clock[0]):
+            with self.assertRaises(chart_page.ChartUnavailableError):
+                chart_page.open_chart_for_date(page, "2026-11-05")
+        self.assertEqual(clock[0], 0)
+        self.assertEqual(refreshes, [])
+
+    def test_unavailable_message_appearing_during_wait_prevents_refresh(self):
+        page, clock, refreshes = self.make_page(ready_at=2)
+        page.locator.return_value.is_visible.side_effect = lambda: clock[0] >= 2
+        with redirect_stdout(io.StringIO()), patch.object(chart_page.time, "monotonic", side_effect=lambda: clock[0]):
+            with self.assertRaises(chart_page.ChartUnavailableError):
+                chart_page.wait_for_chart_table(page, "table")
+        self.assertEqual(clock[0], 2)
+        self.assertEqual(refreshes, [])
+
+    def test_stale_previous_country_error_does_not_create_a_cutoff(self):
+        page, _, _ = self.make_page()
+        page.url = chart_page.build_chart_url("2026-11-05", "regional-co-weekly")
+        page.locator.return_value.is_visible.return_value = True
+        page.goto.side_effect = chart_page.PlaywrightError("net::ERR_INTERNET_DISCONNECTED")
+        with redirect_stdout(io.StringIO()):
+            with self.assertRaises(RuntimeError) as error:
+                chart_page.open_chart_for_date(page, "2026-11-05", "regional-au-weekly")
+        self.assertNotIsInstance(error.exception, chart_page.ChartUnavailableError)
 
 
 if __name__ == "__main__":

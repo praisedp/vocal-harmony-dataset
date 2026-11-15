@@ -10,15 +10,15 @@ Built following the [Google Chrome Browser Automation Guide](https://app.notion.
 
 1. **Fully Configurable via [config.json](file:///Users/praise/Developer/spotify-charts/config.json):**
    - Change `start_date`, `stop_date`, `chart_types`, wait times, and folders without editing Python code. `chart_types: "all"` selects all 74 locations; a list such as `["global", "co", "au"]` selects a subset. Older configurations containing only `chart_type` still select one chart.
-2. **Prioritized Failed Date Retries (`failed.txt`):**
+2. **Failed Date Retries (`failed.txt`):**
    - Any date that encounters a download error or fails to load is automatically recorded in `failed.txt`.
-   - On every rerun, failed dates are retried first within each region, before its other missing weeks.
+   - On every rerun, failed dates are retried alongside other missing weeks in newest-to-oldest order. This avoids hitting an old unavailable retry before collecting newer charts.
    - Retries use a reduced 5.0s navigation timeout (`retry_page_timeout_seconds`), while downloads retain their own timeout. These are per-operation limits, not a five-second total attempt limit.
    - After initial navigation, both fresh and failed weeks get a separate 25-second table-loading window. While the table is missing, the page refreshes at 5, 10, 15 and 20 seconds; reload time counts toward that same window. Navigation timeouts/network errors also enter this recovery window. Recovery stops as soon as the table appears.
    - When a failed date succeeds on retry, it is added to `completed.txt` and removed from `failed.txt`.
 3. **Auto-Resume via `completed.txt`:**
    - Global keeps the existing root `completed.txt` and `failed.txt`. Each country uses `state/<chart-type>/completed.txt` and `failed.txt`, so Global dates never suppress country downloads.
-   - Every run checks every week in scope, filling gaps rather than jumping past the oldest completed date. Completed records count only when a valid CSV exists. Missing/corrupt files are retried; valid files saved before a crash are recovered.
+   - Every run checks every week in scope, filling gaps above any saved availability cutoff rather than jumping past the oldest completed date. Completed records count only when a valid CSV exists. Missing/corrupt files are retried; valid files saved before a crash are recovered.
    - An in-flight date is recorded as failed before navigation, then cleared only after a valid CSV is saved and completion is recorded. `Ctrl+C` stops the whole run and leaves it resumable.
 4. **Rich Terminal Interface:**
    - Real-time progress bar showing current active week, completed count, remaining count, elapsed time, and ETA.
@@ -30,7 +30,9 @@ Built following the [Google Chrome Browser Automation Guide](https://app.notion.
    - Waits 3s on failure before proceeding to avoid hammering the site.
 7. **Verified Coverage:**
    - Reports validated CSV weeks, failed weeks, and outstanding weeks separately per region. Failed dates never count as complete. After attempting a region's range, the scraper continues to the next country even if failures remain; a rerun revisits those failures.
-   - Some countries may not have charts for the entire historical range. Unavailable weeks stay in that region's failure ledger; they are not silently marked complete. Short charts and gaps in ranks are allowed, as seen in existing exports. Validation confirms a usable chart file, not that Spotify supplied all 200 entries.
+   - When Spotify displays the exact "Couldn't find this chart" heading in its empty-state panel, that location stops immediately and the next location begins. The date is saved to `state/<chart-type>/unavailable_from.txt`. Missing weeks at that date and earlier are skipped on future runs, including old failed dates; existing valid older CSVs are preserved. Coverage reports cutoff skips separately from completed downloads and failures.
+   - This stopping policy follows the observed unavailable page; it does not establish the country's true chart launch date, since Spotify's message can also mean a chart was taken down. Timeouts, network errors and generic HTTP errors do not create cutoffs. Short charts and gaps in ranks are allowed, as seen in existing exports. Validation confirms a usable chart file, not that Spotify supplied all 200 entries.
+   - To deliberately recheck older dates, remove that location's `unavailable_from.txt` before restarting. Ordinary failures above the cutoff remain retryable.
    - Files are named `downloads/<chart-type>-YYYY-MM-DD.csv`, preventing country/date collisions and remaining compatible with the master builder. Downloads are validated and atomically published; malformed files, HTTP errors, redirects to another week/region, and mismatched server chart filenames are rejected.
 
 ---
@@ -86,14 +88,14 @@ If an older scraper is running, stop it with `Ctrl+C` first, then restart with t
 uv run python main.py
 ```
 
-### 2. Two-Phase Execution Flow
+### 2. Execution Flow
 For Global, then each country:
 
 1. Audit all requested weeks against the saved CSVs and that region's ledgers.
-2. Retry failed weeks first, then attempt every other missing week, newest to oldest.
-3. Keep failures recorded and continue to the next country. Final coverage shows anything still outstanding.
+2. Attempt missing and failed weeks in one newest-to-oldest sequence, respecting any saved cutoff.
+3. Stop the location on the explicit unavailable-chart panel, save its cutoff and move to the next location. Other failures stay recorded and do not stop the sequence. Final coverage separates cutoff skips from outstanding failures.
 
-The process exits with code 1 if requested weeks remain outstanding, 130 when interrupted, and 0 when all are verified. Read-only `--status` exits with 0 after reporting coverage.
+The process exits with code 1 if non-skipped requested weeks remain outstanding, 130 when interrupted, and 0 when all non-skipped weeks are verified. Read-only `--status` exits with 0 after reporting coverage, including cutoff skips.
 
 ### 3. Pausing & Resuming
 - Press **`Ctrl+C`** in the terminal anytime to pause or cancel.

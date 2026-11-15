@@ -21,9 +21,21 @@ BASE_VIEW_URL = "https://charts.spotify.com/charts/view"
 DEFAULT_CHART_TYPE = "regional-global-weekly"
 TABLE_TIMEOUT_MS = 25000
 TABLE_REFRESH_INTERVAL_MS = 5000
+CHART_NOT_FOUND_SELECTOR = '[data-encore-id="emptyState"] h3:text-is("Couldn\'t find this chart")'
 
 
-def wait_for_chart_table(page: Page, selector: str) -> tuple[bool, int | None]:
+class ChartUnavailableError(RuntimeError):
+    """Spotify explicitly displayed its unavailable-chart empty state."""
+
+
+def check_chart_unavailable(page: Page, expected_url: str | None = None) -> None:
+    if page.locator(CHART_NOT_FOUND_SELECTOR).is_visible():
+        if expected_url is not None and urlsplit(page.url).path.rstrip("/") != urlsplit(expected_url).path.rstrip("/"):
+            raise RuntimeError(f"Unavailable page is for a different region/week: {page.url}")
+        raise ChartUnavailableError("Spotify displayed: Couldn't find this chart")
+
+
+def wait_for_chart_table(page: Page, selector: str, expected_url: str | None = None) -> tuple[bool, int | None]:
     """Give the table 25 seconds, refreshing at 5, 10, 15 and 20 seconds.
 
     Reload time counts toward the same deadline. A successful table load stops
@@ -34,17 +46,22 @@ def wait_for_chart_table(page: Page, selector: str) -> tuple[bool, int | None]:
     next_refresh = deadline - TABLE_TIMEOUT_MS / 1000 + interval
     last_http_status = None
     while True:
+        check_chart_unavailable(page, expected_url)
         now = time.monotonic()
         if now >= deadline:
             return False, last_http_status
         wait_seconds = min(next_refresh, deadline) - now
         if wait_seconds > 0:
             try:
-                page.locator(selector).first.wait_for(
-                    state="attached", timeout=max(1, math.ceil(wait_seconds * 1000))
+                # Wake for either outcome, so an explicit unavailable message
+                # does not consume the 25-second refresh window.
+                page.locator(f"{selector}, {CHART_NOT_FOUND_SELECTOR}").first.wait_for(
+                    state="visible", timeout=max(1, math.ceil(wait_seconds * 1000))
                 )
+                check_chart_unavailable(page, expected_url)
                 return True, last_http_status
             except PlaywrightTimeoutError:
+                check_chart_unavailable(page, expected_url)
                 pass
         now = time.monotonic()
         if now >= deadline:
@@ -104,10 +121,12 @@ def open_chart_for_date(
         # window, including previously failed weeks with a 5-second goto limit.
         print(f"[!] Navigation did not finish; trying table refresh recovery: {err}")
 
+    check_chart_unavailable(page, target_url)
+
     # Wait for dynamic table / chart content to attach if present
     table_found = False
     if wait_for_selector:
-        table_found, refreshed_status = wait_for_chart_table(page, wait_for_selector)
+        table_found, refreshed_status = wait_for_chart_table(page, wait_for_selector, target_url)
         if refreshed_status is not None:
             http_status = refreshed_status
 
@@ -153,6 +172,8 @@ def open_and_download_chart(
     # Wait configured seconds after page load before triggering download
     if wait_seconds > 0:
         time.sleep(wait_seconds)
+
+    check_chart_unavailable(page, build_chart_url(date_str, chart_type))
 
     filename = target_filename or f"{chart_type}-{date_str}.csv"
     saved_path = download_chart_csv(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 from contextlib import ExitStack
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import time
 
@@ -18,12 +18,13 @@ from rich.table import Table
 
 from browser import get_browser_session
 from chart_csv import validate_chart_csv
-from chart_page import open_and_download_chart
+from chart_page import ChartUnavailableError, open_and_download_chart
 from config import CONFIG_FILE_PATH, ScraperConfig, get_config
 from date_utils import (
     generate_weekly_dates_backwards,
     load_completed_dates,
     load_failed_dates,
+    parse_date,
     record_completed_date,
     record_failed_date,
     remove_failed_date,
@@ -42,10 +43,25 @@ class RegionPlan:
     completed: set[str]
     retries: list[str]
     remaining: list[str]
+    skipped: set[str] = field(default_factory=set)
+    cutoff: str | None = None
 
     @property
     def outstanding(self) -> int:
-        return len(self.all_dates) - len(self.completed)
+        return len(self.all_dates) - len(self.completed) - len(self.skipped)
+
+
+def cutoff_file(config: ScraperConfig) -> Path:
+    return config.state_dir / config.chart_type / "unavailable_from.txt"
+
+
+def load_cutoff(config: ScraperConfig) -> str | None:
+    dates = load_completed_dates(cutoff_file(config))
+    if not dates:
+        return None
+    if len(dates) != 1:
+        raise ValueError(f"Expected one cutoff date in {cutoff_file(config)}")
+    return parse_date(dates[0]).isoformat()
 
 
 def config_for_region(config: ScraperConfig, chart_type: str) -> ScraperConfig:
@@ -67,6 +83,7 @@ def prepare_region(config: ScraperConfig, *, reconcile: bool = True) -> RegionPl
     """
     dates = generate_weekly_dates_backwards(config.start_date, config.stop_date)
     scope = set(dates)
+    cutoff = load_cutoff(config)
     recorded = load_completed_dates(config.completed_file)
     completed = set()
     for date_str in dates:
@@ -79,6 +96,11 @@ def prepare_region(config: ScraperConfig, *, reconcile: bool = True) -> RegionPl
             continue
         completed.add(date_str)
 
+    # Keep valid older CSVs as completed. A saved cutoff excludes missing weeks
+    # at/before the observed unavailable page, rather than claiming downloads.
+    skipped = {date_str for date_str in dates
+               if cutoff is not None and date_str <= cutoff and date_str not in completed}
+
     invalid_records = (set(recorded) & scope) - completed
     recovered = [date_str for date_str in dates if date_str in completed and date_str not in recorded]
     if reconcile:
@@ -86,26 +108,30 @@ def prepare_region(config: ScraperConfig, *, reconcile: bool = True) -> RegionPl
             save_dates(config.completed_file,
                        [date_str for date_str in recorded if date_str not in invalid_records] + recovered)
         for date_str in dates:
-            if date_str in invalid_records:
+            if date_str in invalid_records and date_str not in skipped:
                 record_failed_date(config.failed_file, date_str)
         failed = set(sync_failed_dates(config.failed_file, config.completed_file))
     else:
         failed = set(load_failed_dates(config.failed_file)) | invalid_records
-    retries = [date_str for date_str in dates if date_str in failed and date_str not in completed]
-    remaining = [date_str for date_str in dates if date_str not in completed and date_str not in failed]
-    return RegionPlan(config, dates, completed, retries, remaining)
+    retries = [date_str for date_str in dates
+               if date_str in failed and date_str not in completed and date_str not in skipped]
+    remaining = [date_str for date_str in dates
+                 if date_str not in completed and date_str not in failed and date_str not in skipped]
+    return RegionPlan(config, dates, completed, retries, remaining, skipped, cutoff)
 
 
 def download_region(page, plan: RegionPlan) -> RegionPlan:
-    """Attempt each outstanding date once, with previous failures first."""
+    """Work newest to oldest; stop at an explicit unavailable-chart page."""
     config = plan.config
     name = region_name(config.chart_type)
     console.print(f"\n[bold cyan]{name} ({config.chart_type})[/bold cyan]: "
                   f"{len(plan.completed)}/{len(plan.all_dates)} verified; "
                   f"{len(plan.retries)} retries, {len(plan.remaining)} other missing weeks")
     console.print(f"Failure records: {config.failed_file}")
-    queue = [(date_str, True) for date_str in plan.retries]
-    queue.extend((date_str, False) for date_str in plan.remaining)
+    retry_dates = set(plan.retries)
+    pending_dates = retry_dates | set(plan.remaining)
+    queue = [(date_str, date_str in retry_dates) for date_str in plan.all_dates
+             if date_str in pending_dates]
     with Progress(SpinnerColumn(), TextColumn("{task.description}"), BarColumn(),
                   MofNCompleteColumn(), TimeElapsedColumn(), TimeRemainingColumn(),
                   console=console) as progress:
@@ -129,6 +155,17 @@ def download_region(page, plan: RegionPlan) -> RegionPlan:
                 if saved_file.resolve() != expected.resolve():
                     raise ValueError(f"Unexpected saved CSV path: {saved_file}")
                 validate_chart_csv(saved_file)
+            except ChartUnavailableError:
+                # Save before leaving the country, so reruns never regenerate
+                # the same unavailable date and older years from the full range.
+                save_dates(cutoff_file(config), [date_str])
+                remove_failed_date(config.failed_file, date_str)
+                progress.console.print(
+                    f"{name}: chart unavailable at {date_str}. Saved cutoff; "
+                    "skipping this date and older weeks and moving to the next location.",
+                    markup=False,
+                )
+                break
             except Exception as err:
                 progress.console.print(f"Failed {name} {date_str}: {err}", markup=False)
                 if config.failure_retry_wait_seconds > 0:
@@ -146,18 +183,21 @@ def download_region(page, plan: RegionPlan) -> RegionPlan:
 
 def print_summary(plans: list[RegionPlan]) -> None:
     table = Table(title="Verified chart coverage")
-    for title in ("Location", "CSV weeks", "Weeks in scope", "Failed / interrupted", "Outstanding"):
+    for title in ("Location", "CSV weeks", "Weeks in scope", "Cutoff skips", "Failed / interrupted", "Outstanding"):
         table.add_column(title)
     for plan in plans:
         table.add_row(region_name(plan.config.chart_type), str(len(plan.completed)),
-                      str(len(plan.all_dates)), str(len(plan.retries)), str(plan.outstanding))
+                      str(len(plan.all_dates)), str(len(plan.skipped)),
+                      str(len(plan.retries)), str(plan.outstanding))
     console.print(table)
     outstanding = sum(plan.outstanding for plan in plans)
     if outstanding:
         console.print(f"[yellow]{outstanding:,} region/weeks remain outstanding. "
                       "Rerun to retry; each region keeps its own failure records.[/yellow]")
     else:
-        console.print("[green]All requested region/weeks have validated CSVs.[/green]")
+        skipped_count = sum(len(plan.skipped) for plan in plans)
+        console.print(f"[green]All non-skipped region/weeks have validated CSVs. "
+                      f"{skipped_count:,} weeks excluded by saved availability cutoffs.[/green]")
 
 
 def run_batch_downloader(config: ScraperConfig, *, status_only: bool = False) -> list[RegionPlan]:

@@ -135,13 +135,15 @@ class ScraperTests(unittest.TestCase):
         self.assertEqual(load_failed_dates(self.config.failed_file), [DATES[1]])
         self.assertEqual(load_failed_dates(main.config_for_region(self.config, "regional-au-weekly").failed_file), [])
 
-    def test_retries_first_and_success_clears_failure_without_repeat_downloads(self):
+    def test_newest_first_with_retry_timeouts_and_no_repeat_downloads(self):
         save_dates(self.config.failed_file, [DATES[1]])
         plan = main.prepare_region(self.config)
         with patch.object(main, "open_and_download_chart", side_effect=self.fake_download) as download:
             result = main.download_region(object(), plan)
         self.assertEqual([call.kwargs["date_str"] for call in download.call_args_list],
-                         [DATES[1], DATES[0], DATES[2]])
+                         DATES)
+        self.assertEqual([call.kwargs["page_timeout_ms"] for call in download.call_args_list],
+                         [25000, 5000, 25000])
         self.assertEqual(result.outstanding, 0)
         self.assertEqual(load_failed_dates(self.config.failed_file), [])
         with patch.object(main, "get_browser_session") as session:
@@ -190,6 +192,57 @@ class ScraperTests(unittest.TestCase):
         self.assertEqual(result.outstanding, 3)
         self.assertEqual(load_completed_dates(self.config.completed_file), [])
         self.assertEqual(set(load_failed_dates(self.config.failed_file)), set(DATES))
+
+    def test_unavailable_country_stops_at_boundary_and_next_country_still_runs(self):
+        self.config.chart_types = resolve_chart_types(["co", "au"])
+        calls = []
+
+        def download(**kwargs):
+            calls.append((kwargs["chart_type"], kwargs["date_str"]))
+            if calls[-1] == ("regional-co-weekly", DATES[1]):
+                raise chart_page.ChartUnavailableError("Couldn't find this chart")
+            return self.fake_download(**kwargs)
+
+        @contextmanager
+        def browser(**kwargs):
+            yield None, object()
+
+        with patch.object(main, "get_browser_session", side_effect=browser):
+            with patch.object(main, "open_and_download_chart", side_effect=download):
+                plans = main.run_batch_downloader(self.config)
+        self.assertEqual(calls, [("regional-co-weekly", DATES[0]), ("regional-co-weekly", DATES[1])]
+                         + [("regional-au-weekly", date) for date in DATES])
+        self.assertEqual(plans[0].skipped, set(DATES[1:]))
+        self.assertEqual(plans[0].completed, {DATES[0]})
+        self.assertEqual(plans[0].outstanding, 0)
+        co = main.config_for_region(self.config, "regional-co-weekly")
+        self.assertEqual(main.load_cutoff(co), DATES[1])
+        self.assertEqual(load_failed_dates(co.failed_file), [])
+
+        # A persisted boundary survives a rerun; no older dates are regenerated.
+        with patch.object(main, "get_browser_session") as session:
+            with patch.object(main, "open_and_download_chart") as download:
+                main.run_batch_downloader(self.config)
+        session.assert_not_called()
+        download.assert_not_called()
+
+    def test_saved_cutoff_filters_older_failures_but_preserves_valid_older_csvs(self):
+        save_dates(main.cutoff_file(self.config), [DATES[1]])
+        save_dates(self.config.failed_file, DATES)
+        write_chart(self.csv_path(self.config, DATES[-1]))
+        plan = main.prepare_region(self.config)
+        self.assertEqual(plan.completed, {DATES[-1]})
+        self.assertEqual(plan.skipped, {DATES[1]})
+        self.assertEqual(plan.retries, [DATES[0]])
+        self.assertEqual(plan.outstanding, 1)
+        self.assertIn(DATES[1], load_failed_dates(self.config.failed_file))
+
+    def test_network_failures_never_create_availability_cutoffs(self):
+        with patch.object(main, "open_and_download_chart", side_effect=RuntimeError("network timeout")):
+            result = main.download_region(object(), main.prepare_region(self.config))
+        self.assertIsNone(result.cutoff)
+        self.assertFalse(main.cutoff_file(self.config).exists())
+        self.assertEqual(result.outstanding, 3)
 
     def test_downloader_atomically_publishes_valid_csv_and_preserves_old_file_on_error(self):
         page = MagicMock()

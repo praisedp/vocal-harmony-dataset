@@ -24,3 +24,6 @@ state/
 
 # Generated aggregated datasets
 data/
+
+# Environment variables
+.env
