@@ -12,8 +12,9 @@ from typing import Generator
 
 from playwright.sync_api import BrowserContext, Page, sync_playwright
 
-DEFAULT_PROFILE_DIR = Path(".chrome-automation-profile").resolve()
-DEFAULT_DOWNLOADS_DIR = Path("downloads").resolve()
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_PROFILE_DIR = PROJECT_DIR / ".chrome-automation-profile"
+DEFAULT_DOWNLOADS_DIR = PROJECT_DIR / "downloads"
 
 
 def launch_chrome_context(

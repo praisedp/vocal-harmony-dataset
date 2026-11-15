@@ -1,9 +1,17 @@
 """Deterministic timing checks for table refresh recovery; no browser or sleeps."""
 
 import io
+from pathlib import Path
+import sys
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import MagicMock, patch
+
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+for _folder in ("scraper", "pipeline"):
+    _path = str(PROJECT_DIR / _folder)
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 import chart_page
 

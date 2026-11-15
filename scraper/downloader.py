@@ -17,7 +17,7 @@ from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 
 from chart_csv import validate_chart_csv
 
-DEFAULT_DOWNLOADS_DIR = Path(__file__).resolve().parent / "downloads"
+DEFAULT_DOWNLOADS_DIR = Path(__file__).resolve().parent.parent / "downloads"
 
 # Ordered list of reliable CSS selectors for the CSV download button
 CSV_BUTTON_SELECTORS = [

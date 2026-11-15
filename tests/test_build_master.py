@@ -2,10 +2,17 @@
 
 import csv
 import io
+import sys
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+for _folder in ("scraper", "pipeline"):
+    _path = str(PROJECT_DIR / _folder)
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 from rich.console import Console
 

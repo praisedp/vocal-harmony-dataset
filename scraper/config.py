@@ -11,7 +11,7 @@ from pathlib import Path
 
 from regions import resolve_chart_types
 
-PROJECT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = Path(__file__).resolve().parent.parent
 CONFIG_FILE_PATH = PROJECT_DIR / "config.json"
 
 
@@ -27,8 +27,8 @@ class ScraperConfig:
     retry_page_timeout_seconds: float = 5.0
     standard_page_timeout_seconds: float = 25.0
     downloads_dir: Path = PROJECT_DIR / "downloads"
-    completed_file: Path = PROJECT_DIR / "completed.txt"
-    failed_file: Path = PROJECT_DIR / "failed.txt"
+    completed_file: Path = PROJECT_DIR / "state/completed.txt"
+    failed_file: Path = PROJECT_DIR / "state/failed.txt"
     headless: bool = False
     profile_dir: Path = PROJECT_DIR / ".chrome-automation-profile"
     download_timeout_ms: int = 25000
@@ -48,8 +48,8 @@ class ScraperConfig:
             return (config_path.resolve().parent / data.get(key, default)).resolve()
 
         downloads_dir = configured_path("downloads_dir", "downloads")
-        completed_file = configured_path("completed_file", "completed.txt")
-        failed_file = configured_path("failed_file", "failed.txt")
+        completed_file = configured_path("completed_file", "state/completed.txt")
+        failed_file = configured_path("failed_file", "state/failed.txt")
         profile_dir = configured_path("profile_dir", ".chrome-automation-profile")
 
         return cls(

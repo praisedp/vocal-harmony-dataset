@@ -26,7 +26,7 @@ from rich.table import Table
 
 console = Console()
 
-PROJECT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_INPUT_DIR = PROJECT_DIR / "downloads"
 DEFAULT_OUTPUT_FILE = PROJECT_DIR / "data/master.csv"
 

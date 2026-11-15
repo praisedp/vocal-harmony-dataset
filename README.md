@@ -10,14 +10,14 @@ Built following the [Google Chrome Browser Automation Guide](https://app.notion.
 
 1. **Fully Configurable via [config.json](file:///Users/praise/Developer/spotify-charts/config.json):**
    - Change `start_date`, `stop_date`, `chart_types`, wait times, and folders without editing Python code. `chart_types: "all"` selects all 74 locations; a list such as `["global", "co", "au"]` selects a subset. Older configurations containing only `chart_type` still select one chart.
-2. **Failed Date Retries (`failed.txt`):**
-   - Any date that encounters a download error or fails to load is automatically recorded in `failed.txt`.
+2. **Failed Date Retries (`state/failed.txt`):**
+   - Any date that encounters a download error or fails to load is automatically recorded in `state/failed.txt`.
    - On every rerun, failed dates are retried alongside other missing weeks in newest-to-oldest order. This avoids hitting an old unavailable retry before collecting newer charts.
    - Retries use a reduced 5.0s navigation timeout (`retry_page_timeout_seconds`), while downloads retain their own timeout. These are per-operation limits, not a five-second total attempt limit.
    - After initial navigation, both fresh and failed weeks get a separate 25-second table-loading window. While the table is missing, the page refreshes at 5, 10, 15 and 20 seconds; reload time counts toward that same window. Navigation timeouts/network errors also enter this recovery window. Recovery stops as soon as the table appears.
-   - When a failed date succeeds on retry, it is added to `completed.txt` and removed from `failed.txt`.
-3. **Auto-Resume via `completed.txt`:**
-   - Global keeps the existing root `completed.txt` and `failed.txt`. Each country uses `state/<chart-type>/completed.txt` and `failed.txt`, so Global dates never suppress country downloads.
+   - When a failed date succeeds on retry, it is added to `state/completed.txt` and removed from `state/failed.txt`.
+3. **Auto-Resume via `state/completed.txt`:**
+   - Global keeps `state/completed.txt` and `state/failed.txt`. Each country uses `state/<chart-type>/completed.txt` and `failed.txt`, so Global dates never suppress country downloads.
    - Every run checks every week in scope, filling gaps above any saved availability cutoff rather than jumping past the oldest completed date. Completed records count only when a valid CSV exists. Missing/corrupt files are retried; valid files saved before a crash are recovered.
    - An in-flight date is recorded as failed before navigation, then cleared only after a valid CSV is saved and completion is recorded. `Ctrl+C` stops the whole run and leaves it resumable.
 4. **Rich Terminal Interface:**
@@ -41,17 +41,20 @@ Built following the [Google Chrome Browser Automation Guide](https://app.notion.
 
 | File | Purpose |
 | --- | --- |
-| `regions.py` | All 74 dropdown locations, their names, country codes and weekly chart identifiers. |
-| `chart_csv.py` | Downloaded chart header, row and rank validation. |
-| [build_master.py](file:///Users/praise/Developer/spotify-charts/build_master.py) | **Dataset Aggregator & Deduplicator:** Scans `downloads/*.csv`, filters duplicates by Spotify URI, and builds/updates `data/master.csv` incrementally. |
+| [scraper/regions.py](file:///Users/praise/Developer/spotify-charts/scraper/regions.py) | All 74 dropdown locations, their names, country codes and weekly chart identifiers. |
+| [scraper/chart_csv.py](file:///Users/praise/Developer/spotify-charts/scraper/chart_csv.py) | Downloaded chart header, row and rank validation. |
+| [pipeline/build_master.py](file:///Users/praise/Developer/spotify-charts/pipeline/build_master.py) | **Dataset Aggregator & Deduplicator:** Scans `downloads/*.csv`, filters duplicates by Spotify URI, and builds/updates `data/master.csv` incrementally. |
+| [pipeline/build_master_genre.py](file:///Users/praise/Developer/spotify-charts/pipeline/build_master_genre.py) | **Last.fm Genre & Metadata Enricher:** Incrementally enriches `data/master.csv` into `data/master_genre.csv` with resumable artist caching. |
 | [config.json](file:///Users/praise/Developer/spotify-charts/config.json) | Central settings file (`start_date`, `stop_date`, wait delays, directories). |
-| [config.py](file:///Users/praise/Developer/spotify-charts/config.py) | Python configuration loader and fallback defaults. |
-| [main.py](file:///Users/praise/Developer/spotify-charts/main.py) | **Batch Runner:** Global then country-by-country, one shared authenticated browser, independent retries and coverage audit. |
-| [date_utils.py](file:///Users/praise/Developer/spotify-charts/date_utils.py) | **Date & State Logic:** Calculates weekly reverse dates, tracks `completed.txt` and `failed.txt`, and computes remaining dates. |
-| [downloader.py](file:///Users/praise/Developer/spotify-charts/downloader.py) | **CSV Downloader:** Locates download button, handles Playwright download events, and saves to `downloads/`. |
-| [chart_page.py](file:///Users/praise/Developer/spotify-charts/chart_page.py) | **Single-Date Page Handler:** Navigates to a specific date URL with configurable timeouts and verifies readiness. |
-| [browser.py](file:///Users/praise/Developer/spotify-charts/browser.py) | **Browser Lifecycle:** Manages persistent Chrome context and downloads configuration. |
-| [login.py](file:///Users/praise/Developer/spotify-charts/login.py) | Interactive utility to sign in or refresh your Spotify session if needed. |
+| [scraper/config.py](file:///Users/praise/Developer/spotify-charts/scraper/config.py) | Python configuration loader and fallback defaults. |
+| [scraper/main.py](file:///Users/praise/Developer/spotify-charts/scraper/main.py) | **Batch Runner:** Global then country-by-country, one shared authenticated browser, independent retries and coverage audit. |
+| [scraper/date_utils.py](file:///Users/praise/Developer/spotify-charts/scraper/date_utils.py) | **Date & State Logic:** Calculates weekly reverse dates, tracks `state/completed.txt` and `state/failed.txt`, and computes remaining dates. |
+| [scraper/downloader.py](file:///Users/praise/Developer/spotify-charts/scraper/downloader.py) | **CSV Downloader:** Locates download button, handles Playwright download events, and saves to `downloads/`. |
+| [scraper/chart_page.py](file:///Users/praise/Developer/spotify-charts/scraper/chart_page.py) | **Single-Date Page Handler:** Navigates to a specific date URL with configurable timeouts and verifies readiness. |
+| [scraper/browser.py](file:///Users/praise/Developer/spotify-charts/scraper/browser.py) | **Browser Lifecycle:** Manages persistent Chrome context and downloads configuration. |
+| [scraper/login.py](file:///Users/praise/Developer/spotify-charts/scraper/login.py) | Interactive utility to sign in or refresh your Spotify session if needed. |
+| `tests/` | Offline `unittest` regression suite (`test_scraper.py`, `test_table_recovery.py`, `test_build_master.py`, `test_build_master_genre.py`). |
+| `data/samples/` | Sample Last.fm output CSVs (`sample_genres.csv`, `sample_100_full.csv`). |
 
 ---
 
@@ -69,8 +72,8 @@ Built following the [Google Chrome Browser Automation Guide](https://app.notion.
   "retry_page_timeout_seconds": 5.0,
   "standard_page_timeout_seconds": 25.0,
   "downloads_dir": "downloads",
-  "completed_file": "completed.txt",
-  "failed_file": "failed.txt",
+  "completed_file": "state/completed.txt",
+  "failed_file": "state/failed.txt",
   "headless": false,
   "profile_dir": ".chrome-automation-profile",
   "download_timeout_ms": 25000
@@ -85,7 +88,7 @@ Built following the [Google Chrome Browser Automation Guide](https://app.notion.
 If an older scraper is running, stop it with `Ctrl+C` first, then restart with the command below. Existing progress and downloads are reused. The configured range has 519 weeks per location (38,406 region/weeks across all 74); not all locations necessarily have data that far back.
 
 ```bash
-uv run python main.py
+uv run python scraper/main.py
 ```
 
 ### 2. Execution Flow
@@ -99,18 +102,18 @@ The process exits with code 1 if non-skipped requested weeks remain outstanding,
 
 ### 3. Pausing & Resuming
 - Press **`Ctrl+C`** in the terminal anytime to pause or cancel.
-- Run `uv run python main.py` again. It checks all selected regions and skips verified CSVs, retries failures within each region, and fills every remaining gap.
+- Run `uv run python scraper/main.py` again. It checks all selected regions and skips verified CSVs, retries failures within each region, and fills every remaining gap.
 - Run one scraper at a time; the Chrome profile and date ledgers are shared.
 
 ### 4. Build / Update Master Dataset (`data/master.csv`)
 Consolidates all downloaded weekly CSVs into a single deduplicated dataset, ignoring temporary documents and only adding new tracks on subsequent runs:
 
 ```bash
-uv run python build_master.py
+uv run python pipeline/build_master.py
 ```
 
 The script runs independently of the downloader and saves to `data/master.csv`.
-Default paths are relative to the script, so it also works when launched from
+Default paths are relative to the project root, so it also works when launched from
 another directory. It reads only visible files ending in `.csv` (case insensitive),
 ignoring extensionless documents and temporary files.
 
@@ -129,43 +132,46 @@ fails. Run one builder at a time.
 
 ```bash
 # Optional input/output locations and preview size
-uv run python build_master.py --input-dir downloads --output data/master.csv --preview 10
+uv run python pipeline/build_master.py --input-dir downloads --output data/master.csv --preview 10
+
+# Enrich tracks with Last.fm genre & metadata into data/master_genre.csv (resumable)
+uv run python pipeline/build_master_genre.py
 
 # Verify incremental updates using temporary test data
-uv run python -m unittest test_build_master.py
+uv run python -m unittest tests/test_build_master.py tests/test_build_master_genre.py
 ```
 
 ### 5. Command-Line Overrides (Optional)
 
 ```bash
 # Override start date on the fly
-uv run python main.py --start-date 2026-10-22
+uv run python scraper/main.py --start-date 2026-10-22
 
 # Run headless in the background
-uv run python main.py --headless
+uv run python scraper/main.py --headless
 
 # Select just Global, Colombia and Australia
-uv run python main.py --regions global co au
+uv run python scraper/main.py --regions global co au
 
 # List all dropdown locations
-uv run python main.py --list-regions
+uv run python scraper/main.py --list-regions
 
 # Audit all configured locations without opening Chrome or modifying state
-uv run python main.py --status
+uv run python scraper/main.py --status
 
 # Run offline regression tests (no Chrome or network)
-uv run python -m unittest discover -v
+uv run python -m unittest discover -s tests -v
 ```
 
 ### 6. Standalone Helpers
 
 ```bash
 # Preview date calculations
-uv run python date_utils.py 2026-11-05 --preview 10
+uv run python scraper/date_utils.py 2026-11-05 --preview 10
 
 # Test downloading a single date
-uv run python downloader.py 2026-11-05
+uv run python scraper/downloader.py 2026-11-05
 
 # Refresh session if cookies ever expire
-uv run python login.py
+uv run python scraper/login.py
 ```

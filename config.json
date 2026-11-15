@@ -9,8 +9,8 @@
   "retry_page_timeout_seconds": 5.0,
   "standard_page_timeout_seconds": 25.0,
   "downloads_dir": "downloads",
-  "completed_file": "completed.txt",
-  "failed_file": "failed.txt",
+  "completed_file": "state/completed.txt",
+  "failed_file": "state/failed.txt",
   "headless": false,
   "profile_dir": ".chrome-automation-profile",
   "download_timeout_ms": 25000

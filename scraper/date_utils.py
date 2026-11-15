@@ -159,7 +159,7 @@ def sync_failed_dates(
 def get_remaining_dates(
     start_date: Union[str, date],
     stop_date: Union[str, date] = DEFAULT_STOP_DATE,
-    completed_file: Union[str, Path] = "completed.txt",
+    completed_file: Union[str, Path] = Path(__file__).resolve().parent.parent / "state/completed.txt",
 ) -> tuple[list[str], list[str], str | None]:
     """Calculate every missing weekly date, including gaps before the oldest record.
 
