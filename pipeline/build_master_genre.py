@@ -30,7 +30,6 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from rich.console import Console
 from rich.progress import (
-    BarColumn,
     MofNCompleteColumn,
     Progress,
     SpinnerColumn,
@@ -716,7 +715,6 @@ def build_master_genre(
         with Progress(
             SpinnerColumn(),
             TextColumn("{task.description}"),
-            BarColumn(),
             MofNCompleteColumn(),
             TimeElapsedColumn(),
             TimeRemainingColumn(),

@@ -141,6 +141,22 @@ uv run python pipeline/build_master_genre.py
 uv run python -m unittest tests/test_build_master.py tests/test_build_master_genre.py
 ```
 
+### YouTube Music discovery sample
+
+Search for five song candidates per track for 100 random entries from `data/master.csv`:
+
+```bash
+uv run python pipeline/sample_ytmusic.py
+```
+
+Defaults: seed `42`, country context `LK`, one-second spacing, no login. Each run
+creates a new `data/samples/ytmusic_<timestamp>/` containing `sample.csv`,
+`candidates.csv`, `raw.jsonl` and `summary.json`. Candidate rank is search order,
+not a verified match. Missing metadata stays blank. Responses are flushed after
+each query, and failures are recorded. This only discovers songs; it downloads no
+audio. Use `--count`, `--seed`, `--limit`, `--location`, `--delay` or `--output-dir`
+to customize. An explicit output directory must not already exist.
+
 ### 5. Command-Line Overrides (Optional)
 
 ```bash
